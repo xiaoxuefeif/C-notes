@@ -4,6 +4,8 @@
 # include<math.h>
 # include <stdbool.h>
 
+
+// è‡ªå®šä¹‰strcpyå‡½æ•° 
 char* my_strcpy(char *s1,const char *s2)
 {
 	char *p=s1;
@@ -21,19 +23,26 @@ int main()
 {
 
 	char s[]={"abcdefghi"};
-	// char *s="abc" Ä¿±êº¯Êı±ØĞë¿É±ä 
-	// strcpy Óöµ½'\0'½áÊø£¬'\0'Ò²»á¿½±´¹ıÈ¥ 
+	// char *s="abc" ç›®æ ‡å‡½æ•°å¿…é¡»å¯å˜ 
+	// strcpy é‡åˆ°'\0'ç»“æŸï¼Œ'\0'ä¹Ÿä¼šæ‹·è´è¿‡å» 
+	// strncpy ç¬¬ä¸‰ä¸ªå‚æ•°è®¾ç½®ä¸ºæ‹·è´å­—èŠ‚æ•° 
 	
-	// Ä¬ÈÏÓĞ'\0' 
+	// é»˜è®¤æœ‰'\0' 
 	char arr1[]={"helloworld"};
 	printf("%s\n", strcpy(s,arr1));
 	
-	// Ä¬ÈÏÃ»ÓĞ'\0'
+	// é»˜è®¤æ²¡æœ‰'\0'
 	char arr2[]={'h','e','l','l','o'};
 	printf("%s\n", strcpy(s,arr2));
 	
-	// ×Ô¶¨Òåº¯Êı
+	// è‡ªå®šä¹‰å‡½æ•°
 	printf("%s\n", my_strcpy(s,arr1));
+	
+	char s1[]={"abcdef"};
+	char s2[]={"helloworld"};
+	printf("%s\n", strncpy(s1,s2,3)); 
+	printf("%s\n",s1);
+	
 	return 0; 
 } 
  
