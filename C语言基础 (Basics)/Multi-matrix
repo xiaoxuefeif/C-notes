@@ -1,1 +1,316 @@
+"""
+team 2 members: 肖雪飞 杜佳俊 庞兵兵 罗嘉伟 左鸿宇
+"""
+import multiprocessing as mp
+import random
+import threading
+import time
 
+from matrix_multiply import matrix_multiplication_non_multiprocess
+from matrix_multiply import matrix_multiplication_with_multiprocess
+from matrix_multiply import matrix_compare
+
+
+"""
+第一版：使用zip进行分块矩阵乘法计算，使用多进程多线程操作时使用非阻塞式的函数获取任务队列
+
+第二版：改用for循环进行矩阵乘法，使用了进程池管理进程，发现与手动管理进程的计算速度有大幅提升，决定继续优化
+
+第三版：
+(1) 不使用进程池，继续使用手动管理，将处理结果队列的线程改为单线程，将创建的进程数从8提升到14，并未提升
+(2) 将矩阵乘法函数改造为动态分块并研究了大型矩阵中不同分块对计算速度的影响
+(3) 添加：通知结果处理线程所有任务已完成finished_event.set()，预防阻塞
+
+第四版：
+(1) 优化任务分配策略：动态分块可以减小每个任务的计算量，让更多的进程并行工作，但是本作业要求为四块，
+    每个任务分配给一个进程执行后，在所有任务入队后放入结束信号
+(2) 重新使用多线程处理结果队列，并发现本机最佳的进程线程比(14:6)，线程数量尽量小是为预防线程竞争和减少上下文切换的开销
+(3) 减少任务队列检查次数：使用阻塞式的函数queue.get()，避免频繁调用queue.get_nowait()，以减少频繁检查队列是否为空，避免频繁抛出异常
+(4) 批量处理结果：在结果处理线程中批量获取结果，减少队列操作次数。
+    在handle_queues函数中，通过设置合理的timeout批量获取结果，减少队列操作次数
+
+ps: 本小组以牺牲一个pc风扇的代价计算得出10000*10000的矩阵需要花费12780.4030s，约4小时，
+    以此纪念逝去的风扇(生命于2024年6月4日凌晨4:25结束)，RIP
+"""
+
+
+# 生成随机矩阵(float_values=True 为浮点数矩阵)
+def generate_random_matrix(matrix_size, float_values=False):
+    if float_values:
+        return [[random.uniform(-10000, 10000) for _ in range(matrix_size)] for _ in range(matrix_size)]
+    else:
+        return [[random.randint(-10000, 10000) for _ in range(matrix_size)] for _ in range(matrix_size)]
+
+
+# 矩阵乘法（可用于实现下超大矩阵的再次分块）
+def block_matrix_multiply(A, B, block_size):
+    n = len(A)
+    C = [[0] * n for _ in range(n)]
+    for i in range(0, n, block_size):
+        for j in range(0, n, block_size):
+            for k in range(0, n, block_size):
+                for ii in range(i, min(i + block_size, n)):
+                    for jj in range(j, min(j + block_size, n)):
+                        sum = 0
+                        for kk in range(k, min(k + block_size, n)):
+                            sum += A[ii][kk] * B[kk][jj]
+                        C[ii][jj] += sum
+    return C
+
+
+# 定义矩阵加法函数
+def add_matrices(C, D):
+    return [[c + d for c, d in zip(C_row, D_row)] for C_row, D_row in zip(C, D)]
+
+
+# 定义处理矩阵乘法任务的工作进程函数
+def worker_multiply(task_queue, result_queue, block_size):
+    task = task_queue.get()
+    if task is not None:  # 收到结束信号
+        task_id, A, B = task
+        C = block_matrix_multiply(A, B, block_size)
+        result_queue.put((task_id, C))
+
+
+# 定义处理矩阵加法任务的工作进程函数
+def worker_add(task_queue, result_queue):
+    task = task_queue.get()
+    if task is not None:
+        task_id, C, D = task
+        result = add_matrices(C, D)
+        result_queue.put((task_id, result))
+
+
+# 将矩阵划分为子矩阵的函数
+def split_matrix(matrix):
+    mid = len(matrix) // 2
+    top = matrix[:mid]
+    bottom = matrix[mid:]
+    left = [row[:mid] for row in top]
+    right = [row[mid:] for row in top]
+    left_bottom = [row[:mid] for row in bottom]
+    right_bottom = [row[mid:] for row in bottom]
+    return left, right, left_bottom, right_bottom
+
+
+# 获取子矩阵的函数
+def get_submatrices(A, B):
+    A11, A12, A21, A22 = split_matrix(A)
+    B11, B12, B21, B22 = split_matrix(B)
+    return (A11, A12, A21, A22), (B11, B12, B21, B22)
+
+
+# 合并子矩阵的函数
+def merge_submatrices(C11, C12, C21, C22, original_size):
+    # 合并子矩阵时，仅保留原始矩阵大小的部分
+    n = original_size // 2
+    top = [C11_row + C12_row[:n] for C11_row, C12_row in zip(C11, C12[:len(C12)])]
+    bottom = [C21_row + C22_row[:n] for C21_row, C22_row in zip(C21[:len(C21)], C22[:len(C22)])]
+    return top + bottom
+
+
+# 定义多线程处理任务队列和结果队列的函数
+def handle_queues(result_queue, multiplication_results, addition_queue, finished_event):
+    while not finished_event.is_set() or not result_queue.empty():
+        try:
+            task_id, C_sub = result_queue.get(timeout=1)
+            matrix_id, part_id = task_id.split('_')
+            if matrix_id not in multiplication_results:
+                multiplication_results[matrix_id] = {}
+            multiplication_results[matrix_id][part_id] = C_sub
+            if len(multiplication_results[matrix_id]) == 2:
+                C1 = multiplication_results[matrix_id]["1"]
+                C2 = multiplication_results[matrix_id]["2"]
+                addition_queue.put((matrix_id, C1, C2))
+        except mp.queues.Empty:
+            pass
+
+
+# 处理加法结果队列
+def handle_addition_queue(result_queue, final_results, finished_event):
+    while not finished_event.is_set() or not result_queue.empty():
+        try:
+            task_id, C = result_queue.get(timeout=1)
+            final_results[task_id] = C
+        except mp.queues.Empty:
+            pass
+
+
+# 奇数维度矩阵的补零操作函数
+def pad_matrix(matrix, size):
+    padded_matrix = [[0] * size for _ in range(size)]
+    for i in range(len(matrix)):
+        for j in range(len(matrix[0])):
+            padded_matrix[i][j] = matrix[i][j]
+    return padded_matrix
+
+
+# 矩阵截取函数
+def trim_matrix(matrix, size):
+    return [row[:size] for row in matrix[:size]]
+
+
+# ********************多进程验证***************************
+# 多进程：小组-对比组验证
+def multi_check(A_test, B_test, final_result, group_multi_time):
+    print("小组多进程运行时间：", group_multi_time)
+
+    start_time = time.time()  # 开始时间
+    multi_process_result = matrix_multiplication_with_multiprocess(A_test, B_test)
+    end_time = time.time()  # 结束时间
+
+    print("对比组多进程运行时间：", (end_time - start_time) * 2)
+
+    print("多进程结果一致性：", matrix_compare(multi_process_result, final_result))
+
+
+# ********************单进程验证***************************
+# 单进程矩阵乘法
+def single_matrix_multiply(A, B):
+    result = [[0 for _ in range(len(B[0]))] for _ in range(len(A))]
+    for i in range(len(A)):
+        for j in range(len(B[0])):
+            for k in range(len(B)):
+                result[i][j] += A[i][k] * B[k][j]
+    return result
+
+
+# 单进程：小组-对比组验证
+def single_check(A_test, B_test):
+    start_time = time.time()  # 开始时间
+    final_result = single_matrix_multiply(A_test, B_test)
+    end_time = time.time()  # 结束时间
+    print("小组单进程运行时间：", end_time - start_time)
+
+    start_time = time.time()  # 开始时间
+    single_process_result = matrix_multiplication_non_multiprocess(A_test, B_test)
+    end_time = time.time()  # 结束时间
+    print("对比组单进程运行时间：", (end_time - start_time) * 2)
+
+    print("单进程结果一致性：", matrix_compare(final_result, single_process_result))
+
+
+# 主函数
+def main():
+    # 鲁棒性
+    while True:
+        try:
+            matrix_size = int(input("请输入方阵大小(n > 0): "))  # 输入矩阵大小
+            if matrix_size <= 0:
+                print("请输入一个正整数作为矩阵大小！")
+            else:
+                break  # 输入合法，跳出循环
+        except ValueError:
+            print("请输入一个有效的整数作为矩阵大小！")
+
+    A = generate_random_matrix(matrix_size, float_values=True)  # 生成随机矩阵A(False)
+    B = generate_random_matrix(matrix_size, float_values=True)  # 生成随机矩阵B
+
+    # 对照组使用矩阵(未补零矩阵)
+    A_test = A
+    B_test = B
+
+    original_size = matrix_size  # 保存原始矩阵大小, 使得矩阵大小复原
+
+    # 检查矩阵维度，补零使得矩阵维度为偶数
+    if matrix_size % 2 != 0:
+        matrix_size += 1
+        A = pad_matrix(A, matrix_size)
+        B = pad_matrix(B, matrix_size)
+
+    # 得到对半分块结果
+    submatrices_A, submatrices_B = get_submatrices(A, B)
+    A11, A12, A21, A22 = submatrices_A
+    B11, B12, B21, B22 = submatrices_B
+
+    # 乘法任务队列
+    task_queue = mp.Queue()
+    # 乘法结果队列
+    multiplication_result_queue = mp.Queue()
+    # 加法进程队列
+    addition_queue = mp.Queue()
+    # 加法结果队列
+    addition_result_queue = mp.Queue()
+    # 用于在进程之间传递简单的信号，通常用于一个进程等待另一个进程完成某个操作或达到某个状态。
+    finished_event = mp.Event()
+
+    block_size = matrix_size  # 超大矩阵优化变量：根据实际情况调整继续切块的大小
+
+    # 将子矩阵乘法任务添加到任务队列中
+    tasks = [
+        ("C11_1", A11, B11),
+        ("C12_1", A11, B12),
+        ("C21_1", A21, B11),
+        ("C22_1", A21, B12),
+        ("C11_2", A12, B21),
+        ("C12_2", A12, B22),
+        ("C21_2", A22, B21),
+        ("C22_2", A22, B22)
+    ]
+
+    for task in tasks:
+        task_queue.put(task)
+
+    # 使用8个工作进程来执行乘法
+    processes = [mp.Process(target=worker_multiply, args=(task_queue, multiplication_result_queue, block_size)) for _ in
+                 range(8)]
+
+    start_time = time.time()  # 开始时间
+
+    for p in processes:
+        p.start()
+
+    # 使用8个线程处理乘法结果队列
+    multiplication_results = {}
+    threads = [threading.Thread(target=handle_queues, args=(
+        multiplication_result_queue, multiplication_results, addition_queue, finished_event)) for _ in range(8)]
+    for t in threads:
+        t.start()
+
+    for p in processes:
+        p.join()
+
+    # 启动4个进程处理加法
+    add_processes = [mp.Process(target=worker_add, args=(addition_queue, addition_result_queue)) for _ in range(4)]
+    for p in add_processes:
+        p.start()
+
+    # 启动4个线程处理加法结果队列
+    final_results = {}
+    addition_threads = [
+        threading.Thread(target=handle_addition_queue, args=(addition_result_queue, final_results, finished_event)) for
+        _
+        in range(4)]
+    for t in addition_threads:
+        t.start()
+
+    for p in add_processes:
+        p.join()
+
+    finished_event.set()
+
+    for t in threads + addition_threads:
+        t.join()
+
+    # 合并子矩阵
+    C11 = final_results["C11"]
+    C12 = final_results["C12"]
+    C21 = final_results["C21"]
+    C22 = final_results["C22"]
+
+    # 合并矩阵结果
+    final_result = merge_submatrices(C11, C12, C21, C22, original_size)
+
+    # 截取结果矩阵中有效部分(针对奇数维度矩阵)
+    final_result = trim_matrix(final_result, original_size)
+
+    end_time = time.time()  # 结束时间
+
+    # 验证计算结果
+    # single_check(A_test, B_test)
+    print("")
+    multi_check(A_test, B_test, final_result, end_time - start_time)
+
+
+if __name__ == "__main__":
+    main()
